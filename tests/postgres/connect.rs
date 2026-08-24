@@ -1,8 +1,9 @@
 use std::io::{self, Read};
 use std::net::TcpListener;
 use std::thread;
+use std::time::{Duration, Instant};
 
-use sqlx::postgres::PgConnectOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, Error, PgConnection};
 
 /// Accept a connection, read the 8-byte SSLRequest, and hang up without
@@ -57,4 +58,41 @@ async fn closing_before_answering_sslrequest_is_an_eof_not_a_protocol_error() {
         ),
         other => panic!("expected an EOF I/O error, got {other:?}"),
     }
+}
+
+/// A peer that accepts and then drops the connection must be redialled until the
+/// acquire deadline, the same as one that is refusing connections outright.
+///
+/// Before this was fixed the pool retried exactly `ConnectionRefused` and a
+/// transient `Database` error, so a connection dropped in transit - what a proxy
+/// or port forwarder does when it sheds load - returned on the first attempt in
+/// under a millisecond, with `acquire_timeout` barely touched.
+///
+/// The assertion is a FLOOR on elapsed time, not a ceiling: before the fix this
+/// returns in ~1 ms, so any floor near the timeout separates the two cases
+/// without being sensitive to how loaded the machine is.
+#[sqlx_macros::test]
+async fn a_connection_dropped_in_transit_is_retried_until_the_deadline() {
+    const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(750);
+
+    let port = accept_then_close().expect("bind the fake server");
+    let url = format!("postgres://user:password@127.0.0.1:{port}/database");
+
+    let started = Instant::now();
+    let error = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(ACQUIRE_TIMEOUT)
+        .connect(&url)
+        .await
+        .expect_err("a peer that hangs up can never serve a connection");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(error, Error::PoolTimedOut),
+        "a retried connect should exhaust the deadline, got {error:?}"
+    );
+    assert!(
+        elapsed >= ACQUIRE_TIMEOUT / 2,
+        "expected the pool to keep retrying for about {ACQUIRE_TIMEOUT:?}, gave up after {elapsed:?}"
+    );
 }

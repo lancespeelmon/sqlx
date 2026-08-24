@@ -374,8 +374,18 @@ impl<DB: Database> PoolInner<DB> {
                     }
                 }
 
-                // an IO error while connecting is assumed to be the system starting up
-                Ok(Err(Error::Io(e))) if e.kind() == std::io::ErrorKind::ConnectionRefused => (),
+                // A transport-level failure while connecting is transient: the server
+                // may still be starting up, or the connection may have been dropped
+                // in transit by a proxy, load balancer or port forwarder shedding
+                // load. Either way the next attempt may well succeed, and the
+                // deadline above bounds the cost of being wrong.
+                //
+                // This is deliberately a fixed list rather than every `io::Error`.
+                // A wrong host or a refused hostname lookup is not going to fix
+                // itself, and retrying those until `acquire_timeout` would replace a
+                // precise error with `PoolTimedOut` - trading a diagnosable failure
+                // for an opaque one.
+                Ok(Err(Error::Io(e))) if is_transient_connect_error(e.kind()) => (),
 
                 // We got a transient database error, retry.
                 Ok(Err(Error::Database(error))) if error.is_transient_in_connect_phase() => (),
@@ -618,6 +628,78 @@ impl<DB: Database> Drop for DecrementSizeGuard<DB> {
 
             // and here we release the permit we got on construction
             self.pool.semaphore.release(1);
+        }
+    }
+}
+
+/// Whether an I/O failure raised while establishing a connection is worth
+/// another attempt before the acquire deadline.
+///
+/// These are the kinds that describe a connection that did not survive being
+/// set up, rather than one that could never be set up. A server still starting
+/// refuses; a proxy, load balancer or port forwarder shedding load accepts and
+/// then resets, aborts, or hangs up mid-handshake. Retrying any of those is the
+/// same bet the `ConnectionRefused` arm has always made.
+///
+/// Kinds NOT listed here are returned to the caller immediately and on purpose.
+/// A bad host, a failed lookup or a rejected certificate does not become true on
+/// the second attempt, and retrying it to the deadline would report
+/// `PoolTimedOut` in place of the error that actually explains the failure.
+fn is_transient_connect_error(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind;
+
+    matches!(
+        kind,
+        // The listener is not up yet.
+        ErrorKind::ConnectionRefused
+            // Dropped in transit: reset by the peer, aborted locally, or closed
+            // part-way through the handshake.
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::BrokenPipe
+            // A hop timed out. The deadline still bounds how long we keep trying.
+            | ErrorKind::TimedOut
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transient_connect_error;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn a_connection_that_died_in_transit_is_retried() {
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::BrokenPipe,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                is_transient_connect_error(kind),
+                "{kind:?} describes a connection worth redialling"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failure_that_will_not_fix_itself_is_returned() {
+        // Retrying these to the deadline would replace a precise error with
+        // `PoolTimedOut`, which is strictly less useful to the caller.
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotFound,
+            ErrorKind::InvalidInput,
+            ErrorKind::InvalidData,
+            ErrorKind::AddrNotAvailable,
+        ] {
+            assert!(
+                !is_transient_connect_error(kind),
+                "{kind:?} is not going to succeed on a second attempt"
+            );
         }
     }
 }
