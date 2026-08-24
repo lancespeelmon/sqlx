@@ -1,3 +1,5 @@
+use std::io;
+
 use crate::error::Error;
 use crate::net::tls::{self, TlsConfig};
 use crate::net::{Socket, SocketIntoBox, WithSocket};
@@ -88,7 +90,16 @@ async fn request_upgrade(
 
     let mut response = [0u8];
 
-    socket.read(&mut &mut response[..]).await?;
+    // Check the count, do not just look at the buffer. `Socket::read` resolves to
+    // `Ok(0)` when the peer hangs up, leaving `response` holding the `0u8` it was
+    // initialised with - which the `other` arm below would then report as a byte
+    // the server sent, naming a protocol violation for what is really an EOF.
+    if socket.read(&mut &mut response[..]).await? == 0 {
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "server closed the connection without responding to SSLRequest",
+        )));
+    }
 
     match response[0] {
         b'S' => {
